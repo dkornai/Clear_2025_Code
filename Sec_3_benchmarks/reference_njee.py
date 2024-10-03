@@ -142,6 +142,109 @@ def NJEE_estimate_condentropy(
         
     return np.round(H_xy,4)
 
+def NJEE_train_models(
+        X:np.ndarray, 
+        Y:list[np.ndarray], 
+        device, 
+        n_bins=250,
+        hidden_size=25,
+        epochs=1001,
+        batch_size=1000,
+        ):
+    """
+    Train the models for estimating conditional entropy H(X|Y) using NJEE
+    Y can in fact be a list of multiple variables. This function returns the trained models
+    """
+    assert isinstance(device, torch.device)
+    assert isinstance(X, np.ndarray)
+    assert isinstance(Y, list)
+    assert all(isinstance(y, np.ndarray) for y in Y)
+    assert all(X.shape[0] == y.shape[0] for y in Y)
+        
+    xdims = X.shape[1]
+    ydims = sum([y.shape[1] for y in Y])
+
+    # Init list of models and optimizers for each dimension
+    model_lst_cond = []
+    for m in range(0, xdims):
+        model_lst_cond.append(ModelBasicClassification(input_shape=m + ydims, n_classes=n_bins, hidden_size=hidden_size))
+
+    for m in range(0, xdims): # send models to device
+        model_lst_cond[m].to(device)
+
+    opt_lst_cond = []
+    for m in range(0, xdims):
+        opt_lst_cond.append(optim.Adam(model_lst_cond[m].parameters(), lr=0.001))
+
+
+    # Prepare input data
+    input_lst = [[] for _ in range(xdims)]
+    for n in range(xdims):
+    # input is the 1, 2, ..., n-1-th dimension of X, and all of Y
+        base_input = np.concatenate(Y, axis=1)
+        if   n == 0:
+            # corresponds to the input "Y" for H(X_1|Y)
+            input_full = base_input
+        elif n >= 1:
+            # corresponds to the input "X_1, ..., X_{n-1}, Y" for H(X_n|X_1, ..., X_{n-1}, Y)
+            input_full = np.concatenate([X[:, :n], base_input], axis=1)
+        
+        for i in range(0, X.shape[0], batch_size):
+            input = input_full[i:i + batch_size]
+
+            input = torch.tensor(input, dtype=torch.float32).contiguous().to(device)
+            input_lst[n].append(input)
+
+
+    # Prepare target data
+    target_lst = [[] for _ in range(xdims)]
+    for n in range(xdims):
+        # target is a discretized version of the n-th dimension of X
+        target_full = X[:, n].reshape(-1, 1)
+        target_full = discretise(target_full, n_bins)
+        
+        for i in range(0, X.shape[0], batch_size):
+            target = target_full[i:i + batch_size]
+
+            target = torch.tensor(target, dtype=torch.long).contiguous().to(device)
+            target_lst[n].append(target)
+
+    # Estimate conditional entropy H(X|Y) using the decomposition formula:
+    """
+    H(X|Y) = H(X_1|Y) + H(X_2|X_1, Y) + H(X_3|X_1, X_2, Y) + ... + H(X_n|X_1, ..., X_{n-1}, Y)
+    """
+    # Entropy will be summed across all dimensions
+    H_perdim = np.zeros(xdims)
+    
+    for n in range(xdims):
+        # Track losses along each epoch
+        losses = []
+        # Train model
+        for i in range(epochs):
+            # Select a random batch as input
+            index = np.random.randint(0, len(input_lst[n]))
+            input = input_lst[n][index]
+            target = target_lst[n][index]
+            
+            # Get output
+            opt_lst_cond[n].zero_grad()
+            output = model_lst_cond[n](input)
+            
+            # Compute the cross-entropy between the output and the target
+            loss = -torch.mean(torch.sum(target * torch.log(output + 1e-12), dim=1))
+            losses.append(loss.item())
+            
+            # Backpropagate and update weights
+            loss.backward()
+            opt_lst_cond[n].step()
+
+            
+            if i % 500 == 0:
+                print(f'Dimension {n+1}/{xdims}, Epoch {i}, Loss: {np.round(np.mean(losses[-25:]),4)}', end='\r')
+
+        H_perdim[n] = np.mean(losses[-25:])
+        
+    return model_lst_cond
 
 def TE_njee(var_from, var_to, device, n_bins, epochs=1001, hidden_size=25, batch_size=1000):
     """
